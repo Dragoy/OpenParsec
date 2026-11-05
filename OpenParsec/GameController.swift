@@ -92,7 +92,7 @@ class GamepadController {
 				// pointer-lock toggles on the connect/disconnect view swap can synthesize a button edge
 				// with no real input — dont forward it unless a session is actually live
 				guard ParsecBackgroundManager.shared.hasActiveConnection else { return }
-				CParsec.sendMouseClickMessage(MOUSE_R, pressed)
+				SecondaryClickArbiter.shared.gcMouseRightChanged(pressed)
 				}
 			mouse.mouseInput?.middleButton?.pressedChangedHandler = {(_: GCControllerButtonInput, _: Float, pressed: Bool) in
 				guard ParsecBackgroundManager.shared.hasActiveConnection else { return }
@@ -182,6 +182,107 @@ class GamepadController {
 		CParsec.sendGameControllerAxisMessage(controllerId: 1, GAMEPAD_AXIS_RY, ButtonFloatToParsecInt(-yvalue))
     }
 
+}
+
+/// Right-button arbitration between GCMouse and UIKit pointer events.
+///
+/// A real mouse reports its right button through GCMouse. A trackpad (Magic Keyboard, Logitech
+/// Combo Touch / Folio Touch, ...) usually does NOT: iPadOS turns a two-finger tap / click into a
+/// secondary click in software, and that interpreted click only reaches the app as an
+/// indirect-pointer UITouch with `.secondary` in `UIEvent.buttonMask`. GCMouse stays authoritative;
+/// the UIKit secondary click is only used as a fallback when GCMouse didn't report a right press
+/// for the same click, so a regular mouse never sends a doubled right click.
+final class SecondaryClickArbiter {
+	static let shared = SecondaryClickArbiter()
+
+	/// How long a UIKit secondary click waits for GCMouse to report the same press before it is
+	/// forwarded itself. GCMouse and UIKit events for one click land within a few ms of each other.
+	private let fallbackDelay: TimeInterval = 0.05
+	/// A GCMouse right press this close to a UIKit secondary click is treated as the same click.
+	private let matchWindow: TimeInterval = 0.15
+
+	private var gcRightPressed = false
+	private var gcRightLastPress: TimeInterval = -.infinity
+	private var gcRightIgnored = false      // GCMouse press arrived after the fallback already sent it
+	private var fallbackRightDown = false   // MOUSE_R down was sent from the UIKit path
+	private var pendingFallback: DispatchWorkItem?
+	private var pendingReleased = false     // the UIKit click ended before the fallback fired
+
+	private init() {}
+
+	private var now: TimeInterval { ProcessInfo.processInfo.systemUptime }
+
+	private var gcMouseHandledRecently: Bool {
+		gcRightPressed || now - gcRightLastPress < matchWindow
+	}
+
+	// MARK: GCMouse path (main queue)
+
+	func gcMouseRightChanged(_ pressed: Bool) {
+		if pressed {
+			gcRightPressed = true
+			gcRightLastPress = now
+			if fallbackRightDown {
+				// UIKit already forwarded this click; its release will lift the button.
+				gcRightIgnored = true
+				return
+			}
+			cancelPending()
+			CParsec.sendMouseClickMessage(MOUSE_R, true)
+		} else {
+			gcRightPressed = false
+			if gcRightIgnored {
+				gcRightIgnored = false
+				return
+			}
+			CParsec.sendMouseClickMessage(MOUSE_R, false)
+		}
+	}
+
+	// MARK: UIKit indirect-pointer path (main queue)
+
+	func uiKitSecondaryChanged(_ pressed: Bool) {
+		if pressed {
+			guard !fallbackRightDown, pendingFallback == nil, !gcMouseHandledRecently else { return }
+			pendingReleased = false
+			let work = DispatchWorkItem { [weak self] in self?.firePending() }
+			pendingFallback = work
+			DispatchQueue.main.asyncAfter(deadline: .now() + fallbackDelay, execute: work)
+		} else if pendingFallback != nil {
+			// Quick tap: lifted before the fallback fired — it will send down + up together.
+			pendingReleased = true
+		} else if fallbackRightDown {
+			fallbackRightDown = false
+			CParsec.sendMouseClickMessage(MOUSE_R, false)
+		}
+	}
+
+	private func firePending() {
+		pendingFallback = nil
+		guard !gcMouseHandledRecently,
+			  ParsecBackgroundManager.shared.hasActiveConnection,
+			  UIApplication.shared.applicationState == .active else { return }
+		CParsec.sendMouseClickMessage(MOUSE_R, true)
+		if pendingReleased {
+			CParsec.sendMouseClickMessage(MOUSE_R, false)
+		} else {
+			fallbackRightDown = true
+		}
+		pendingReleased = false
+	}
+
+	private func cancelPending() {
+		pendingFallback?.cancel()
+		pendingFallback = nil
+		pendingReleased = false
+	}
+
+	/// Drop any in-flight state (disconnect, backgrounding, view teardown) without sending input.
+	func reset() {
+		cancelPending()
+		fallbackRightDown = false
+		gcRightIgnored = false
+	}
 }
 
 protocol InputManagerDelegate: AnyObject {
