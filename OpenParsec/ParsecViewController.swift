@@ -399,6 +399,7 @@ class ParsecViewController: UIViewController, UIScrollViewDelegate, ParsecTouchI
 		super.viewWillDisappear(animated)
 		UIApplication.shared.isIdleTimerDisabled = false
 		stopMomentum()
+		SecondaryClickArbiter.shared.reset()
 		if let parent = parent {
 			parent.setChildForHomeIndicatorAutoHidden(nil)
 			parent.setChildViewControllerForPointerLock(nil)
@@ -717,6 +718,16 @@ extension ParsecViewController: UIGestureRecognizerDelegate {
 	// touchOverlay delivers raw touches here. One finger drives the mouse cursor; two fingers are
 	// classified once per gesture into either pinch-zoom or host scroll-wheel (never both), so the
 	// gestures never fight. No UIScrollView gesture recognizer is in the loop.
+
+	func parsecSecondaryClickChanged(_ pressed: Bool) {
+		// dont leak a right-click to the host while backgrounding (app switch) or after a disconnect;
+		// a release is always passed through so a held button can't get stuck
+		if pressed {
+			guard UIApplication.shared.applicationState == .active,
+				  ParsecBackgroundManager.shared.hasActiveConnection else { return }
+		}
+		SecondaryClickArbiter.shared.uiKitSecondaryChanged(pressed)
+	}
 
 	func parsecTouchesUpdated(_ touches: Set<UITouch>, moved: Bool) {
 		let oldCount = activeTouches.count
@@ -1465,6 +1476,7 @@ extension ParsecViewController: UIKeyInput, UITextInputTraits {
 
 	@objc private func inputWasReleased() {
 		clearToolbarModifiers(sendToHost: false)
+		SecondaryClickArbiter.shared.reset()
 	}
 
 	private func clearToolbarModifiers(sendToHost: Bool) {
@@ -1542,6 +1554,8 @@ extension ParsecViewController: UIKeyInput, UITextInputTraits {
 protocol ParsecTouchInputDelegate: AnyObject {
 	// Called on every touch change with the authoritative set of currently-active touches.
 	func parsecTouchesUpdated(_ activeTouches: Set<UITouch>, moved: Bool)
+	// Secondary (right) button of an external trackpad / mouse, as interpreted by UIKit.
+	func parsecSecondaryClickChanged(_ pressed: Bool)
 }
 
 // A transparent overlay that owns every raw touch and forwards it to the controller. Sitting on
@@ -1550,16 +1564,33 @@ protocol ParsecTouchInputDelegate: AnyObject {
 class TouchOverlayView: UIView {
 	weak var inputDelegate: ParsecTouchInputDelegate?
 
+	private var secondaryPressed = false
+
 	// Forward the live touch set (excluding ended/cancelled) on every event. External mouse /
 	// trackpad input arrives as indirect-pointer touches but is handled entirely by GCMouse, so it's
 	// dropped here — otherwise it warps the direct-mode cursor and fights touchpad-mode drags.
+	// The one exception is the secondary button: iPadOS turns a trackpad two-finger tap / click
+	// into a secondary click only on the UIKit side (GCMouse never sees a right button for it), so
+	// that bit is handed to SecondaryClickArbiter, which forwards it unless GCMouse already did.
 	private func forward(_ event: UIEvent?, moved: Bool) {
-		let active = (event?.allTouches ?? []).filter { touch in
-			guard touch.phase != .ended && touch.phase != .cancelled else { return false }
+		let all = event?.allTouches ?? []
+		let isLive: (UITouch) -> Bool = { $0.phase != .ended && $0.phase != .cancelled }
+		let active = all.filter { touch in
+			guard isLive(touch) else { return false }
 			if #available(iOS 13.4, *), touch.type == .indirectPointer { return false }
 			return true
 		}
 		inputDelegate?.parsecTouchesUpdated(active, moved: moved)
+
+		if #available(iOS 13.4, *), let event = event {
+			let pointerTouches = all.filter { $0.type == .indirectPointer }
+			guard !pointerTouches.isEmpty else { return }
+			let pressed = pointerTouches.contains(where: isLive) && event.buttonMask.contains(.secondary)
+			if pressed != secondaryPressed {
+				secondaryPressed = pressed
+				inputDelegate?.parsecSecondaryClickChanged(pressed)
+			}
+		}
 	}
 	override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) { forward(event, moved: false) }
 	override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) { forward(event, moved: true) }
